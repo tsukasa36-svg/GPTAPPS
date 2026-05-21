@@ -1,0 +1,35 @@
+[project]
+name = "cad-ai-suite"
+version = "0.1.0"
+description = "Prototype tools for labeling STEP CAD files, training PyTorch models, and generating parametric engineering shapes."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "CAD AI Suite" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.0",
+]
+cad = [
+  "cadquery>=2.4",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+cad-ai-trainer = "cad_ai_suite.apps.trainer_app:main"
+cad-ai-generator = "cad_ai_suite.apps.generator_app:main"
+cad-ai-train = "cad_ai_suite.ml.train:main"
+cad-ai-import-steps = "cad_ai_suite.apps.import_steps:main"
+cad-ai-workbench = "cad_ai_suite.apps.web_workbench:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

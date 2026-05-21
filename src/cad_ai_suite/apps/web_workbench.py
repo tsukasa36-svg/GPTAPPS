@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cgi
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,28 +17,36 @@ from cad_ai_suite.ml.train import train_classifier
 
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("CAD_AI_PORT", "8765"))
 RAW_STEP_DIR = Path("data/raw_step")
 GENERATED_DIR = Path("data/generated")
+PREVIEW_DIR = Path("data/previews")
 
 
 class WebWorkbenchHandler(BaseHTTPRequestHandler):
     server_version = "CADAIWorkbench/0.1"
 
     def do_GET(self) -> None:
-        route = urlparse(self.path).path
-        if route == "/":
-            self._send_html(INDEX_HTML)
-        elif route == "/api/files":
-            self._send_json({"files": _list_imported_files()})
-        elif route == "/api/labels":
-            self._send_json({"labels": [_label_to_dict(record) for record in list_labels()]})
-        elif route == "/api/summary":
-            query = parse_qs(urlparse(self.path).query)
-            path = query.get("path", [""])[0]
-            self._send_json({"summary": summarize_step(path)})
-        else:
-            self._send_json({"error": "Not found"}, status=404)
+        try:
+            route = urlparse(self.path).path
+            if route == "/":
+                self._send_html(INDEX_HTML)
+            elif route == "/api/files":
+                self._send_json({"files": _list_imported_files()})
+            elif route == "/api/labels":
+                self._send_json({"labels": [_label_to_dict(record) for record in list_labels()]})
+            elif route == "/api/summary":
+                query = parse_qs(urlparse(self.path).query)
+                path = query.get("path", [""])[0]
+                self._send_json({"summary": summarize_step(path)})
+            elif route == "/api/preview-stl":
+                query = parse_qs(urlparse(self.path).query)
+                path = query.get("path", [""])[0]
+                self._send_file(_step_preview_stl(path), "model/stl")
+            else:
+                self._send_json({"error": "Not found"}, status=404)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=500)
 
     def do_POST(self) -> None:
         route = urlparse(self.path).path
@@ -137,8 +146,17 @@ class WebWorkbenchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_file(self, path: Path, content_type: str) -> None:
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
 
 def _list_imported_files() -> list[dict[str, object]]:
+    labels_by_path = {record.path: record for record in list_labels()}
     RAW_STEP_DIR.mkdir(parents=True, exist_ok=True)
     files = []
     for path in sorted(RAW_STEP_DIR.glob("*")):
@@ -151,16 +169,53 @@ def _list_imported_files() -> list[dict[str, object]]:
         except Exception:
             entity_count = None
             schema = None
+        resolved_path = str(path.resolve())
+        label = labels_by_path.get(resolved_path)
         files.append(
             {
-                "path": str(path.resolve()),
+                "path": resolved_path,
                 "name": path.name,
                 "size": path.stat().st_size,
                 "entity_count": entity_count,
                 "schema": schema,
+                "label": label.label if label else "",
+                "tags": label.tags if label else [],
+                "description": label.description if label else "",
             }
         )
     return files
+
+
+def _step_preview_stl(path: str) -> Path:
+    step_path = _resolve_raw_step_path(path)
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    fingerprint = hashlib.sha256(
+        f"{step_path.resolve()}:{step_path.stat().st_mtime_ns}:{step_path.stat().st_size}".encode("utf-8")
+    ).hexdigest()[:20]
+    stl_path = PREVIEW_DIR / f"{step_path.stem}_{fingerprint}.stl"
+    if stl_path.exists():
+        return stl_path
+
+    try:
+        import cadquery as cq
+    except ImportError as exc:
+        raise RuntimeError("CadQuery is required for STEP previews.") from exc
+
+    model = cq.importers.importStep(str(step_path))
+    cq.exporters.export(model, str(stl_path))
+    return stl_path
+
+
+def _resolve_raw_step_path(path: str) -> Path:
+    candidate = Path(path).expanduser().resolve()
+    raw_root = RAW_STEP_DIR.resolve()
+    if candidate.suffix.lower() not in {".step", ".stp"}:
+        raise ValueError("Preview path must be a STEP/STP file.")
+    if raw_root not in candidate.parents:
+        raise ValueError("Preview path must be inside data/raw_step.")
+    if not candidate.exists():
+        raise FileNotFoundError(candidate)
+    return candidate
 
 
 def _label_to_dict(record) -> dict[str, object]:
@@ -280,7 +335,53 @@ INDEX_HTML = r"""<!doctype html>
     .muted { color: var(--muted); }
     .status { min-height: 24px; color: #065f46; font-weight: 600; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+    .label-layout { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; }
+    .file-list { max-height: 520px; overflow: auto; }
+    .file-card {
+      width: 100%;
+      text-align: left;
+      background: #fff;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    .file-card:hover, .file-card.selected { background: var(--soft); color: var(--text); border-color: #818cf8; }
+    .file-name { display: block; font-weight: 700; overflow-wrap: anywhere; }
+    .file-meta { display: block; color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .file-label { display: inline-block; margin-top: 6px; padding: 3px 7px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 12px; }
+    .viewer-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111827;
+      overflow: hidden;
+      min-height: 340px;
+      position: relative;
+    }
+    #previewCanvas { width: 100%; height: 360px; display: block; background: #111827; }
+    .viewer-note {
+      position: absolute;
+      left: 12px;
+      top: 10px;
+      color: #e5e7eb;
+      background: rgba(17, 24, 39, 0.72);
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .selected-path {
+      padding: 10px;
+      background: #f9fafb;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow-wrap: anywhere;
+      margin-bottom: 12px;
+    }
+    @media (max-width: 900px) {
+      .grid, .label-layout { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -318,37 +419,39 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <section id="label">
-      <div class="panel">
-        <div class="grid">
-          <div>
-            <label>Imported file</label>
-            <select id="labelPath"></select>
-          </div>
-          <div>
-            <label>Part type</label>
-            <input id="partLabel" type="text" placeholder="l_bracket, fixture, mounting_plate">
-          </div>
-          <div>
-            <label>Tags</label>
-            <input id="partTags" type="text" placeholder="bracket, mounting, holes">
-          </div>
-          <div>
-            <label>Description</label>
-            <input id="partDescription" type="text" placeholder="Optional notes">
-          </div>
+      <div class="label-layout">
+        <div class="panel">
+          <h2>Imported STEP Files</h2>
+          <p class="muted">Click one file, preview it, then save a label for only that file.</p>
+          <div id="labelFileList" class="file-list"></div>
         </div>
-        <div class="row" style="margin-top: 12px;">
-          <button onclick="saveLabel()">Save Label</button>
-          <button class="secondary" onclick="refreshAll()">Refresh</button>
+        <div class="panel">
+          <h2>Selected File</h2>
+          <div id="selectedPath" class="selected-path muted">No file selected.</div>
+          <div class="viewer-wrap">
+            <canvas id="previewCanvas"></canvas>
+            <div id="viewerNote" class="viewer-note">Select a STEP file to preview it.</div>
+          </div>
+          <div class="grid" style="margin-top: 12px;">
+            <div>
+              <label>Part type</label>
+              <input id="partLabel" type="text" placeholder="l_bracket, fixture, mounting_plate">
+            </div>
+            <div>
+              <label>Tags</label>
+              <input id="partTags" type="text" placeholder="bracket, mounting, holes">
+            </div>
+            <div>
+              <label>Description</label>
+              <input id="partDescription" type="text" placeholder="Optional notes">
+            </div>
+          </div>
+          <div class="row" style="margin-top: 12px;">
+            <button onclick="saveLabel()">Save Label For Selected File</button>
+            <button class="secondary" onclick="refreshAll()">Refresh</button>
+          </div>
+          <div id="labelStatus" class="status"></div>
         </div>
-        <div id="labelStatus" class="status"></div>
-      </div>
-      <div class="panel">
-        <h2>Labels</h2>
-        <table>
-          <thead><tr><th>Label</th><th>Tags</th><th>Path</th></tr></thead>
-          <tbody id="labelsTable"></tbody>
-        </table>
       </div>
     </section>
 
@@ -382,6 +485,12 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     let files = [];
     let labels = [];
+    let selectedPath = "";
+    let mesh = null;
+    let rotationX = -0.45;
+    let rotationY = 0.75;
+    let dragging = false;
+    let lastPointer = null;
 
     document.querySelectorAll(".tab").forEach(button => {
       button.addEventListener("click", () => {
@@ -404,45 +513,71 @@ INDEX_HTML = r"""<!doctype html>
       const labelsData = await api("/api/labels");
       files = filesData.files;
       labels = labelsData.labels;
+      if (selectedPath && !files.some(file => file.path === selectedPath)) selectedPath = "";
       renderFiles();
+      renderLabelFileList();
       renderLabels();
       renderTrainingSummary();
+      if (!selectedPath && files.length) selectFile(files[0].path, false);
     }
 
     function renderFiles() {
       const table = document.getElementById("filesTable");
-      const select = document.getElementById("labelPath");
       table.innerHTML = "";
-      select.innerHTML = "";
       files.forEach(file => {
         const row = document.createElement("tr");
-        row.innerHTML = `<td>${file.name}</td><td>${file.entity_count ?? ""}</td><td>${file.size}</td><td>${file.path}</td>`;
+        const label = file.label ? `${file.label}` : "";
+        row.innerHTML = `<td>${escapeHtml(file.name)}</td><td>${file.entity_count ?? ""}</td><td>${file.size}</td><td>${escapeHtml(file.path)} ${label ? `<span class="file-label">${escapeHtml(label)}</span>` : ""}</td>`;
         row.onclick = () => {
-          document.getElementById("labelPath").value = file.path;
+          selectFile(file.path, true);
           document.querySelector('[data-tab="label"]').click();
         };
         table.appendChild(row);
-        const option = document.createElement("option");
-        option.value = file.path;
-        option.textContent = file.name;
-        select.appendChild(option);
+      });
+    }
+
+    function renderLabelFileList() {
+      const list = document.getElementById("labelFileList");
+      list.innerHTML = "";
+      if (!files.length) {
+        list.innerHTML = `<p class="muted">No imported files yet. Use the Import STEP tab first.</p>`;
+        return;
+      }
+      files.forEach(file => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `file-card ${file.path === selectedPath ? "selected" : ""}`;
+        const label = file.label ? `<span class="file-label">${escapeHtml(file.label)}</span>` : `<span class="file-meta">Unlabeled</span>`;
+        button.innerHTML = `
+          <span class="file-name">${escapeHtml(file.name)}</span>
+          <span class="file-meta">${file.entity_count ?? "?"} entities | ${file.size} bytes</span>
+          ${label}
+        `;
+        button.onclick = () => selectFile(file.path, true);
+        list.appendChild(button);
       });
     }
 
     function renderLabels() {
-      const table = document.getElementById("labelsTable");
-      table.innerHTML = "";
-      labels.forEach(label => {
-        const row = document.createElement("tr");
-        row.innerHTML = `<td>${label.label}</td><td>${label.tags.join(", ")}</td><td>${label.path}</td>`;
-        row.onclick = () => {
-          document.getElementById("labelPath").value = label.path;
-          document.getElementById("partLabel").value = label.label;
-          document.getElementById("partTags").value = label.tags.join(", ");
-          document.getElementById("partDescription").value = label.description || "";
-        };
-        table.appendChild(row);
+      const labelByPath = new Map(labels.map(label => [label.path, label]));
+      files.forEach(file => {
+        const label = labelByPath.get(file.path);
+        file.label = label ? label.label : "";
+        file.tags = label ? label.tags : [];
+        file.description = label ? label.description : "";
       });
+    }
+
+    async function selectFile(path, loadViewer = true) {
+      selectedPath = path;
+      const file = files.find(item => item.path === path);
+      document.getElementById("selectedPath").textContent = file ? `${file.name} - ${file.path}` : path;
+      document.getElementById("partLabel").value = file?.label || "";
+      document.getElementById("partTags").value = file?.tags?.join(", ") || "";
+      document.getElementById("partDescription").value = file?.description || "";
+      document.getElementById("labelStatus").textContent = file ? `Selected ${file.name}. Saving will update only this file.` : "Selected file.";
+      renderLabelFileList();
+      if (loadViewer) await loadPreview(path);
     }
 
     function renderTrainingSummary() {
@@ -478,10 +613,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function saveLabel() {
-      const path = document.getElementById("labelPath").value;
+      const path = selectedPath;
       const label = document.getElementById("partLabel").value.trim();
       if (!path || !label) {
-        document.getElementById("labelStatus").textContent = "Choose a file and enter a part type.";
+        document.getElementById("labelStatus").textContent = "Click one imported file and enter a part type.";
         return;
       }
       await api("/api/label", {
@@ -494,8 +629,10 @@ INDEX_HTML = r"""<!doctype html>
           description: document.getElementById("partDescription").value
         })
       });
-      document.getElementById("labelStatus").textContent = "Label saved.";
+      const file = files.find(item => item.path === path);
+      document.getElementById("labelStatus").textContent = `Label saved for ${file ? file.name : path}.`;
       await refreshAll();
+      selectFile(path, false);
     }
 
     async function trainModel() {
@@ -524,6 +661,178 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function loadPreview(path) {
+      const note = document.getElementById("viewerNote");
+      note.textContent = "Loading 3D preview...";
+      mesh = null;
+      drawPreview();
+      try {
+        const response = await fetch(`/api/preview-stl?path=${encodeURIComponent(path)}`);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text);
+        }
+        const buffer = await response.arrayBuffer();
+        mesh = parseBinaryStl(buffer);
+        note.textContent = `${mesh.triangles.length} preview triangles. Drag to rotate.`;
+        drawPreview();
+      } catch (error) {
+        note.textContent = `Preview unavailable: ${error.message}`;
+      }
+    }
+
+    function parseBinaryStl(buffer) {
+      const view = new DataView(buffer);
+      const triangleCount = view.getUint32(80, true);
+      const triangles = [];
+      const points = [];
+      let offset = 84;
+      for (let i = 0; i < triangleCount && offset + 50 <= view.byteLength; i++) {
+        const normal = [
+          view.getFloat32(offset, true),
+          view.getFloat32(offset + 4, true),
+          view.getFloat32(offset + 8, true)
+        ];
+        offset += 12;
+        const vertices = [];
+        for (let j = 0; j < 3; j++) {
+          const vertex = [
+            view.getFloat32(offset, true),
+            view.getFloat32(offset + 4, true),
+            view.getFloat32(offset + 8, true)
+          ];
+          offset += 12;
+          vertices.push(vertex);
+          points.push(vertex);
+        }
+        offset += 2;
+        triangles.push({ normal, vertices });
+      }
+      const bounds = computeBounds(points);
+      return { triangles, bounds };
+    }
+
+    function computeBounds(points) {
+      const min = [Infinity, Infinity, Infinity];
+      const max = [-Infinity, -Infinity, -Infinity];
+      points.forEach(point => {
+        for (let i = 0; i < 3; i++) {
+          min[i] = Math.min(min[i], point[i]);
+          max[i] = Math.max(max[i], point[i]);
+        }
+      });
+      const center = min.map((value, index) => (value + max[index]) / 2);
+      const size = Math.max(...max.map((value, index) => value - min[index]), 1);
+      return { min, max, center, size };
+    }
+
+    function setupCanvas() {
+      const canvas = document.getElementById("previewCanvas");
+      canvas.addEventListener("pointerdown", event => {
+        dragging = true;
+        lastPointer = [event.clientX, event.clientY];
+        canvas.setPointerCapture(event.pointerId);
+      });
+      canvas.addEventListener("pointermove", event => {
+        if (!dragging || !lastPointer) return;
+        const dx = event.clientX - lastPointer[0];
+        const dy = event.clientY - lastPointer[1];
+        rotationY += dx * 0.01;
+        rotationX += dy * 0.01;
+        lastPointer = [event.clientX, event.clientY];
+        drawPreview();
+      });
+      canvas.addEventListener("pointerup", () => {
+        dragging = false;
+        lastPointer = null;
+      });
+      window.addEventListener("resize", drawPreview);
+      drawPreview();
+    }
+
+    function drawPreview() {
+      const canvas = document.getElementById("previewCanvas");
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.fillStyle = "#111827";
+      ctx.fillRect(0, 0, rect.width, rect.height);
+      drawGrid(ctx, rect.width, rect.height);
+      if (!mesh) return;
+
+      const scale = Math.min(rect.width, rect.height) * 0.72 / mesh.bounds.size;
+      const projected = mesh.triangles.map(triangle => {
+        const vertices = triangle.vertices.map(vertex => projectVertex(vertex, mesh.bounds.center, scale, rect.width, rect.height));
+        const depth = vertices.reduce((sum, vertex) => sum + vertex.z, 0) / 3;
+        const shade = Math.max(60, Math.min(220, 130 + triangle.normal[2] * 60 + depth * 0.03));
+        return { vertices, depth, shade };
+      }).sort((a, b) => a.depth - b.depth);
+
+      projected.forEach(triangle => {
+        ctx.beginPath();
+        ctx.moveTo(triangle.vertices[0].x, triangle.vertices[0].y);
+        ctx.lineTo(triangle.vertices[1].x, triangle.vertices[1].y);
+        ctx.lineTo(triangle.vertices[2].x, triangle.vertices[2].y);
+        ctx.closePath();
+        ctx.fillStyle = `rgb(${triangle.shade}, ${Math.round(triangle.shade * 0.95)}, ${Math.round(triangle.shade * 0.82)})`;
+        ctx.strokeStyle = "rgba(255,255,255,0.12)";
+        ctx.lineWidth = 0.7;
+        ctx.fill();
+        ctx.stroke();
+      });
+    }
+
+    function drawGrid(ctx, width, height) {
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < width; x += 40) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+      for (let y = 0; y < height; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+    }
+
+    function projectVertex(vertex, center, scale, width, height) {
+      let x = vertex[0] - center[0];
+      let y = vertex[1] - center[1];
+      let z = vertex[2] - center[2];
+      const cosY = Math.cos(rotationY);
+      const sinY = Math.sin(rotationY);
+      const x1 = x * cosY + z * sinY;
+      const z1 = -x * sinY + z * cosY;
+      const cosX = Math.cos(rotationX);
+      const sinX = Math.sin(rotationX);
+      const y1 = y * cosX - z1 * sinX;
+      const z2 = y * sinX + z1 * cosX;
+      return {
+        x: width / 2 + x1 * scale,
+        y: height / 2 - y1 * scale,
+        z: z2
+      };
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    setupCanvas();
     refreshAll();
   </script>
 </body>

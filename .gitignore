@@ -13,6 +13,7 @@ data/processed/*
 !data/processed/.gitkeep
 data/models/*
 !data/models/.gitkeep
+data/previews/
 data/manifests/*
 !data/manifests/.gitkeep
 step_inbox/*

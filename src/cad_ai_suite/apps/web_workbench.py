@@ -187,7 +187,7 @@ def _list_imported_files() -> list[dict[str, object]]:
 
 
 def _step_preview_stl(path: str) -> Path:
-    step_path = _resolve_raw_step_path(path)
+    step_path = _resolve_preview_step_path(path)
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     fingerprint = hashlib.sha256(
         f"{step_path.resolve()}:{step_path.stat().st_mtime_ns}:{step_path.stat().st_size}".encode("utf-8")
@@ -206,13 +206,13 @@ def _step_preview_stl(path: str) -> Path:
     return stl_path
 
 
-def _resolve_raw_step_path(path: str) -> Path:
+def _resolve_preview_step_path(path: str) -> Path:
     candidate = Path(path).expanduser().resolve()
-    raw_root = RAW_STEP_DIR.resolve()
+    allowed_roots = [RAW_STEP_DIR.resolve(), GENERATED_DIR.resolve()]
     if candidate.suffix.lower() not in {".step", ".stp"}:
         raise ValueError("Preview path must be a STEP/STP file.")
-    if raw_root not in candidate.parents:
-        raise ValueError("Preview path must be inside data/raw_step.")
+    if not any(root == candidate.parent or root in candidate.parents for root in allowed_roots):
+        raise ValueError("Preview path must be inside data/raw_step or data/generated.")
     if not candidate.exists():
         raise FileNotFoundError(candidate)
     return candidate
@@ -361,6 +361,7 @@ INDEX_HTML = r"""<!doctype html>
       position: relative;
     }
     #previewCanvas { width: 100%; height: 360px; display: block; background: #111827; }
+    #generatePreviewCanvas { width: 100%; height: 360px; display: block; background: #111827; }
     .viewer-note {
       position: absolute;
       left: 12px;
@@ -479,6 +480,13 @@ INDEX_HTML = r"""<!doctype html>
         <h2>Generated Output</h2>
         <textarea id="generateOutput" readonly></textarea>
       </div>
+      <div class="panel">
+        <h2>Generated Preview</h2>
+        <div class="viewer-wrap">
+          <canvas id="generatePreviewCanvas"></canvas>
+          <div id="generateViewerNote" class="viewer-note">Generate a STEP file to preview it.</div>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -486,11 +494,10 @@ INDEX_HTML = r"""<!doctype html>
     let files = [];
     let labels = [];
     let selectedPath = "";
-    let mesh = null;
-    let rotationX = -0.45;
-    let rotationY = 0.75;
-    let dragging = false;
-    let lastPointer = null;
+    const viewers = {
+      label: createViewerState("previewCanvas", "viewerNote", "Select a STEP file to preview it."),
+      generated: createViewerState("generatePreviewCanvas", "generateViewerNote", "Generate a STEP file to preview it.")
+    };
 
     document.querySelectorAll(".tab").forEach(button => {
       button.addEventListener("click", () => {
@@ -656,16 +663,22 @@ INDEX_HTML = r"""<!doctype html>
         });
         document.getElementById("generateOutput").value = JSON.stringify(data, null, 2);
         document.getElementById("generateStatus").textContent = "Generated CAD output.";
+        const stepPath = data.outputs?.step;
+        if (stepPath) {
+          await loadPreview(stepPath, viewers.generated);
+        } else {
+          resetViewer(viewers.generated, data.outputs?.step_error || "No STEP output was generated.");
+        }
       } catch (error) {
         document.getElementById("generateStatus").textContent = error.message;
       }
     }
 
-    async function loadPreview(path) {
-      const note = document.getElementById("viewerNote");
+    async function loadPreview(path, viewer = viewers.label) {
+      const note = document.getElementById(viewer.noteId);
       note.textContent = "Loading 3D preview...";
-      mesh = null;
-      drawPreview();
+      viewer.mesh = null;
+      drawPreview(viewer);
       try {
         const response = await fetch(`/api/preview-stl?path=${encodeURIComponent(path)}`);
         if (!response.ok) {
@@ -673,12 +686,18 @@ INDEX_HTML = r"""<!doctype html>
           throw new Error(text);
         }
         const buffer = await response.arrayBuffer();
-        mesh = parseBinaryStl(buffer);
-        note.textContent = `${mesh.triangles.length} preview triangles. Drag to rotate.`;
-        drawPreview();
+        viewer.mesh = parseBinaryStl(buffer);
+        note.textContent = `${viewer.mesh.triangles.length} preview triangles. Drag to rotate.`;
+        drawPreview(viewer);
       } catch (error) {
         note.textContent = `Preview unavailable: ${error.message}`;
       }
+    }
+
+    function resetViewer(viewer, message) {
+      viewer.mesh = null;
+      document.getElementById(viewer.noteId).textContent = message;
+      drawPreview(viewer);
     }
 
     function parseBinaryStl(buffer) {
@@ -726,32 +745,53 @@ INDEX_HTML = r"""<!doctype html>
       return { min, max, center, size };
     }
 
-    function setupCanvas() {
-      const canvas = document.getElementById("previewCanvas");
+    function createViewerState(canvasId, noteId, initialMessage) {
+      return {
+        canvasId,
+        noteId,
+        initialMessage,
+        mesh: null,
+        rotationX: -0.45,
+        rotationY: 0.75,
+        dragging: false,
+        lastPointer: null
+      };
+    }
+
+    function setupCanvas(viewer) {
+      const canvas = document.getElementById(viewer.canvasId);
+      if (!canvas) return;
       canvas.addEventListener("pointerdown", event => {
-        dragging = true;
-        lastPointer = [event.clientX, event.clientY];
+        viewer.dragging = true;
+        viewer.lastPointer = [event.clientX, event.clientY];
         canvas.setPointerCapture(event.pointerId);
       });
       canvas.addEventListener("pointermove", event => {
-        if (!dragging || !lastPointer) return;
-        const dx = event.clientX - lastPointer[0];
-        const dy = event.clientY - lastPointer[1];
-        rotationY += dx * 0.01;
-        rotationX += dy * 0.01;
-        lastPointer = [event.clientX, event.clientY];
-        drawPreview();
+        if (!viewer.dragging || !viewer.lastPointer) return;
+        const dx = event.clientX - viewer.lastPointer[0];
+        const dy = event.clientY - viewer.lastPointer[1];
+        viewer.rotationY += dx * 0.01;
+        viewer.rotationX += dy * 0.01;
+        viewer.lastPointer = [event.clientX, event.clientY];
+        drawPreview(viewer);
       });
       canvas.addEventListener("pointerup", () => {
-        dragging = false;
-        lastPointer = null;
+        viewer.dragging = false;
+        viewer.lastPointer = null;
       });
-      window.addEventListener("resize", drawPreview);
-      drawPreview();
+      canvas.addEventListener("pointercancel", () => {
+        viewer.dragging = false;
+        viewer.lastPointer = null;
+      });
+      drawPreview(viewer);
     }
 
-    function drawPreview() {
-      const canvas = document.getElementById("previewCanvas");
+    function drawAllPreviews() {
+      Object.values(viewers).forEach(drawPreview);
+    }
+
+    function drawPreview(viewer) {
+      const canvas = document.getElementById(viewer.canvasId);
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
@@ -763,11 +803,11 @@ INDEX_HTML = r"""<!doctype html>
       ctx.fillStyle = "#111827";
       ctx.fillRect(0, 0, rect.width, rect.height);
       drawGrid(ctx, rect.width, rect.height);
-      if (!mesh) return;
+      if (!viewer.mesh) return;
 
-      const scale = Math.min(rect.width, rect.height) * 0.72 / mesh.bounds.size;
-      const projected = mesh.triangles.map(triangle => {
-        const vertices = triangle.vertices.map(vertex => projectVertex(vertex, mesh.bounds.center, scale, rect.width, rect.height));
+      const scale = Math.min(rect.width, rect.height) * 0.72 / viewer.mesh.bounds.size;
+      const projected = viewer.mesh.triangles.map(triangle => {
+        const vertices = triangle.vertices.map(vertex => projectVertex(vertex, viewer.mesh.bounds.center, scale, rect.width, rect.height, viewer));
         const depth = vertices.reduce((sum, vertex) => sum + vertex.z, 0) / 3;
         const shade = Math.max(60, Math.min(220, 130 + triangle.normal[2] * 60 + depth * 0.03));
         return { vertices, depth, shade };
@@ -804,16 +844,16 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    function projectVertex(vertex, center, scale, width, height) {
+    function projectVertex(vertex, center, scale, width, height, viewer) {
       let x = vertex[0] - center[0];
       let y = vertex[1] - center[1];
       let z = vertex[2] - center[2];
-      const cosY = Math.cos(rotationY);
-      const sinY = Math.sin(rotationY);
+      const cosY = Math.cos(viewer.rotationY);
+      const sinY = Math.sin(viewer.rotationY);
       const x1 = x * cosY + z * sinY;
       const z1 = -x * sinY + z * cosY;
-      const cosX = Math.cos(rotationX);
-      const sinX = Math.sin(rotationX);
+      const cosX = Math.cos(viewer.rotationX);
+      const sinX = Math.sin(viewer.rotationX);
       const y1 = y * cosX - z1 * sinX;
       const z2 = y * sinX + z1 * cosX;
       return {
@@ -832,7 +872,9 @@ INDEX_HTML = r"""<!doctype html>
         .replaceAll("'", "&#039;");
     }
 
-    setupCanvas();
+    setupCanvas(viewers.label);
+    setupCanvas(viewers.generated);
+    window.addEventListener("resize", drawAllPreviews);
     refreshAll();
   </script>
 </body>

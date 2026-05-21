@@ -59,6 +59,7 @@ Start the full GUI workbench:
 
 The workbench has tabs for importing STEP files, labeling, training, and generating new CAD.
 In the Label tab, select one imported STEP file at a time to preview it and save an individual label.
+In the Generate tab, generated STEP files are previewed in the browser after export.
 
 For training with PyTorch:
 

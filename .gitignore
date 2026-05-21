@@ -18,6 +18,8 @@ data/manifests/*
 step_inbox/*
 !step_inbox/README.md
 !step_inbox/imported/
+step_inbox/imported/*
 !step_inbox/imported/.gitkeep
 !step_inbox/rejected/
+step_inbox/rejected/*
 !step_inbox/rejected/.gitkeep
